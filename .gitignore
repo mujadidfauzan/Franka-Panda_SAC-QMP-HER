@@ -1,0 +1,55 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local Python config
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# RL training outputs
+logs/
+models/
+runs/
+wandb/
+
+# TensorBoard and monitor artifacts outside logs/
+events.out.tfevents.*
+monitor.csv
+
+# Saved policies, checkpoints, replay buffers, and videos
+*.zip
+*.pkl
+*.pt
+*.pth
+*.onnx
+*.mp4
+*.avi
+*.mov
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.log

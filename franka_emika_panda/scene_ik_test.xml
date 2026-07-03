@@ -1,0 +1,25 @@
+<mujoco model="panda_ik_test">
+  <include file="panda_rl.xml"/>
+
+  <statistic center="0.3 0 0.4" extent="1.2"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="120" elevation="-20"/>
+  </visual>
+
+  <worldbody>
+    <geom name="floor" type="plane" size="2 2 0.05" rgba="0.8 0.8 0.8 1"/>
+
+    <!-- Target IK: hijau, tidak punya collision -->
+    <body name="target_body" pos="0.45 0.30 0.45" euler="3.14159 0 0">
+      <site name="target_site" type="sphere" size="0.035" rgba="0 1 0 0.7"/>
+
+      <!-- Marker orientasi target -->
+      <geom name="target_x_axis" type="capsule" fromto="0 0 0 0.10 0 0" size="0.006" rgba="1 0 0 1" contype="0" conaffinity="0"/>
+      <geom name="target_y_axis" type="capsule" fromto="0 0 0 0 0.10 0" size="0.006" rgba="0 1 0 1" contype="0" conaffinity="0"/>
+      <geom name="target_z_axis" type="capsule" fromto="0 0 0 0 0 0.10" size="0.006" rgba="0 0 1 1" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+</mujoco>
