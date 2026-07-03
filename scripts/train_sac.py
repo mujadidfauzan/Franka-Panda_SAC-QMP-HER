@@ -101,7 +101,7 @@ class PeriodicArtifactCallback(BaseCallback):
 
         if self.save_video:
             video_path = self.video_dir / f"eval_{step_label}_steps.mp4"
-            self._save_eval_video(video_path)
+            self._save_eval_video(video_path, seed=self.seed + int(step))
 
         if self.verbose:
             print(f"Saved SAC artifacts at {step} timesteps.")
@@ -111,7 +111,7 @@ class PeriodicArtifactCallback(BaseCallback):
             if replay_path != current_path:
                 replay_path.unlink(missing_ok=True)
 
-    def _save_eval_video(self, video_path):
+    def _save_eval_video(self, video_path, seed):
         try:
             import imageio.v2 as imageio
         except ImportError as exc:
@@ -120,11 +120,11 @@ class PeriodicArtifactCallback(BaseCallback):
                 "Install dependencies from requirements.txt."
             ) from exc
 
-        eval_env = PandaReachEnv(render_mode="rgb_array", randomize_target=False)
+        eval_env = PandaReachEnv(render_mode="rgb_array", randomize_target=True)
         frames = []
 
         try:
-            obs, _ = eval_env.reset(seed=self.seed)
+            obs, _ = eval_env.reset(seed=seed)
             first_frame = eval_env.render()
             if first_frame is not None:
                 frames.append(first_frame)

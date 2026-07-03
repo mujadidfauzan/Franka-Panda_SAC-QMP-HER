@@ -1,25 +1,7 @@
 import mujoco
 import numpy as np
 
-
-def orientation_error(current_mat, target_mat):
-    """
-    Menghitung error orientasi antara rotasi current dan target.
-
-    current_mat: rotasi end-effector saat ini, shape (3, 3)
-    target_mat : rotasi target, shape (3, 3)
-
-    Output:
-        error rotasi 3D dalam bentuk angular velocity kecil.
-    """
-
-    error = 0.5 * (
-        np.cross(current_mat[:, 0], target_mat[:, 0])
-        + np.cross(current_mat[:, 1], target_mat[:, 1])
-        + np.cross(current_mat[:, 2], target_mat[:, 2])
-    )
-
-    return error
+from panda_rl.utils.mujoco_utils import orientation_error_vector
 
 
 class DifferentialIK6DController:
@@ -131,7 +113,7 @@ class DifferentialIK6DController:
         current_mat = data.site_xmat[self.site_id].reshape(3, 3).copy()
 
         pos_err = target_pos - current_pos
-        ori_err = orientation_error(current_mat, target_mat)
+        ori_err = orientation_error_vector(current_mat, target_mat)
 
         error_6d = np.concatenate(
             [

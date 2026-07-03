@@ -60,6 +60,7 @@ class PandaReachEnv(gym.Env):
         success_ori_threshold=0.15,
         success_bonus=10.0,
         action_penalty_weight=0.01,
+        ik_max_joint_step=0.08,
     ):
         super().__init__()
 
@@ -84,6 +85,7 @@ class PandaReachEnv(gym.Env):
         self.success_ori_threshold = success_ori_threshold
         self.success_bonus = success_bonus
         self.action_penalty_weight = action_penalty_weight
+        self.ik_max_joint_step = ik_max_joint_step
 
         self.ee_site_name = "ee_site"
         self.ee_site_id = mj_name_to_id(
@@ -122,7 +124,7 @@ class PandaReachEnv(gym.Env):
             pos_weight=1.0,
             ori_weight=0.35,
             damping=0.08,
-            max_joint_step=0.035,
+            max_joint_step=self.ik_max_joint_step,
         )
 
         self.action_space = spaces.Box(
