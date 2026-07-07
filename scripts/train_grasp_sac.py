@@ -29,8 +29,7 @@ class GraspTensorboardCallback(BaseCallback):
         scalar_keys = {
             "reward_reach": "reward/reach",
             "reward_lift": "reward/lift",
-            "reward_gripper": "reward/gripper",
-            "reward_action_penalty": "reward/action_penalty",
+            "reward_close_bonus": "reward/close_bonus",
             "reward_success_bonus": "reward/success_bonus",
             "reward_total": "reward/env_total",
             "reach_distance": "metrics/reach_distance",

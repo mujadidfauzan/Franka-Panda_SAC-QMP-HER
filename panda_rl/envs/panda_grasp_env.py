@@ -58,6 +58,8 @@ class PandaGraspEnv(gym.Env):
         rotation_scale=0.10,
         lift_height=0.05,
         success_bonus=25.0,
+        close_bonus=2.0,
+        close_bonus_distance=0.01,
         action_penalty_weight=0.01,
         ik_max_joint_step=0.08,
     ):
@@ -84,6 +86,8 @@ class PandaGraspEnv(gym.Env):
         self.rotation_scale = rotation_scale
         self.lift_height = lift_height
         self.success_bonus = success_bonus
+        self.close_bonus = close_bonus
+        self.close_bonus_distance = close_bonus_distance
         self.action_penalty_weight = action_penalty_weight
         self.ik_max_joint_step = ik_max_joint_step
 
@@ -343,21 +347,20 @@ class PandaGraspEnv(gym.Env):
         reach_distance = np.linalg.norm(grasp_target_pos - ee_pos)
         lift_progress = self._lift_progress(cube_pos)
         lift_height = max(0.0, float(cube_pos[2] - self.initial_cube_z))
-        close_amount = 0.5 * (1.0 - float(action[6]))
         action_penalty = self.action_penalty_weight * np.sum(np.square(action))
 
         is_success = lift_height >= self.lift_height
         reward_reach = -2.0 * reach_distance
         reward_lift = 10.0 * lift_progress
-        reward_gripper = 0.2 * close_amount if reach_distance < 0.01 else 0.0
-        reward_action_penalty = -action_penalty
+        reward_close_bonus = (
+            self.close_bonus if reach_distance <= self.close_bonus_distance else 0.0
+        )
         reward_success_bonus = self.success_bonus if is_success else 0.0
 
         reward = (
             reward_reach
             + reward_lift
-            # + reward_gripper
-            + reward_action_penalty
+            + reward_close_bonus
             + reward_success_bonus
         )
 
@@ -368,8 +371,7 @@ class PandaGraspEnv(gym.Env):
             "action_penalty": float(action_penalty),
             "reward_reach": float(reward_reach),
             "reward_lift": float(reward_lift),
-            "reward_gripper": float(reward_gripper),
-            "reward_action_penalty": float(reward_action_penalty),
+            "reward_close_bonus": float(reward_close_bonus),
             "reward_success_bonus": float(reward_success_bonus),
             "reward_total": float(reward),
             "is_success": bool(is_success),
