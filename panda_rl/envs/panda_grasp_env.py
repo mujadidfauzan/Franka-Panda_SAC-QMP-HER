@@ -345,23 +345,22 @@ class PandaGraspEnv(gym.Env):
         cube_pos = self.data.xpos[self.cube_body_id].copy()
         grasp_target_pos = cube_pos + np.array([0.0, 0.0, 0.035], dtype=np.float64)
         reach_distance = np.linalg.norm(grasp_target_pos - ee_pos)
-        lift_progress = self._lift_progress(cube_pos)
         lift_height = max(0.0, float(cube_pos[2] - self.initial_cube_z))
+        lift_progress = self._lift_progress(cube_pos)
         action_penalty = self.action_penalty_weight * np.sum(np.square(action))
 
         is_success = lift_height >= self.lift_height
         reward_reach = -2.0 * reach_distance
-        reward_lift = 10.0 * lift_progress
+        reward_lift = self.success_bonus if is_success else 0.0
         reward_close_bonus = (
             self.close_bonus if reach_distance <= self.close_bonus_distance else 0.0
         )
-        reward_success_bonus = self.success_bonus if is_success else 0.0
+        reward_success_bonus = reward_lift
 
         reward = (
             reward_reach
             + reward_lift
             + reward_close_bonus
-            + reward_success_bonus
         )
 
         return float(reward), {
