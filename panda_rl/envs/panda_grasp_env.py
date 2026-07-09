@@ -179,6 +179,7 @@ class PandaGraspEnv(gym.Env):
         )
         self.last_action = np.zeros(self.action_space.shape, dtype=np.float64)
         self.last_ik_info = {}
+        self.last_auto_gripper_closed = False
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -190,6 +191,7 @@ class PandaGraspEnv(gym.Env):
         self.current_step = 0
         self.last_action = np.zeros(self.action_space.shape, dtype=np.float64)
         self.last_ik_info = {}
+        self.last_auto_gripper_closed = False
 
         mujoco.mj_forward(self.model, self.data)
         obs = self._get_obs()
@@ -208,7 +210,7 @@ class PandaGraspEnv(gym.Env):
         self.last_action = action.copy()
 
         self._apply_cartesian_action(action[:6])
-        self._apply_gripper_action(action[6])
+        self._apply_auto_gripper()
 
         for _ in range(self.frame_skip):
             mujoco.mj_step(self.model, self.data)
@@ -307,10 +309,25 @@ class PandaGraspEnv(gym.Env):
         gripper_ctrl = ctrl_min + (gripper_action + 1.0) * 0.5 * (ctrl_max - ctrl_min)
         self.data.ctrl[self.gripper_actuator_id] = gripper_ctrl
 
+    def _apply_auto_gripper(self):
+        reach_distance = self._reach_distance()
+        self.last_auto_gripper_closed = reach_distance <= self.close_bonus_distance
+
+        if self.last_auto_gripper_closed:
+            self._set_gripper_closed()
+        else:
+            self._set_gripper_open()
+
     def _set_gripper_open(self):
         ctrl_min, ctrl_max = self.model.actuator_ctrlrange[self.gripper_actuator_id]
         self.data.ctrl[self.gripper_actuator_id] = (
             ctrl_max if ctrl_max > ctrl_min else 255.0
+        )
+
+    def _set_gripper_closed(self):
+        ctrl_min, ctrl_max = self.model.actuator_ctrlrange[self.gripper_actuator_id]
+        self.data.ctrl[self.gripper_actuator_id] = (
+            ctrl_min if ctrl_max > ctrl_min else 0.0
         )
 
     def _get_obs(self):
@@ -341,10 +358,8 @@ class PandaGraspEnv(gym.Env):
         return obs.astype(np.float32)
 
     def _compute_reward(self, action):
-        ee_pos, _ = self._get_ee_pose()
         cube_pos = self.data.xpos[self.cube_body_id].copy()
-        grasp_target_pos = cube_pos + np.array([0.0, 0.0, 0.035], dtype=np.float64)
-        reach_distance = np.linalg.norm(grasp_target_pos - ee_pos)
+        reach_distance = self._reach_distance()
         lift_height = max(0.0, float(cube_pos[2] - self.initial_cube_z))
         lift_progress = self._lift_progress(cube_pos)
         action_penalty = self.action_penalty_weight * np.sum(np.square(action))
@@ -357,17 +372,14 @@ class PandaGraspEnv(gym.Env):
         )
         reward_success_bonus = reward_lift
 
-        reward = (
-            reward_reach
-            + reward_lift
-            + reward_close_bonus
-        )
+        reward = reward_reach + reward_lift + reward_close_bonus
 
         return float(reward), {
             "reach_distance": float(reach_distance),
             "lift_height": float(lift_height),
             "lift_progress": float(lift_progress),
             "action_penalty": float(action_penalty),
+            "auto_gripper_closed": bool(self.last_auto_gripper_closed),
             "reward_reach": float(reward_reach),
             "reward_lift": float(reward_lift),
             "reward_close_bonus": float(reward_close_bonus),
@@ -379,8 +391,7 @@ class PandaGraspEnv(gym.Env):
     def _get_info(self, **extra):
         ee_pos, _ = self._get_ee_pose()
         cube_pos = self.data.xpos[self.cube_body_id].copy()
-        grasp_target_pos = cube_pos + np.array([0.0, 0.0, 0.035], dtype=np.float64)
-        reach_distance = np.linalg.norm(grasp_target_pos - ee_pos)
+        reach_distance = self._reach_distance()
         lift_height = max(0.0, float(cube_pos[2] - self.initial_cube_z))
 
         info = {
@@ -388,6 +399,7 @@ class PandaGraspEnv(gym.Env):
             "reach_distance": float(reach_distance),
             "lift_height": float(lift_height),
             "lift_progress": float(self._lift_progress(cube_pos)),
+            "auto_gripper_closed": bool(self.last_auto_gripper_closed),
             "cube_pos": cube_pos.copy(),
             "cube_quat": self.data.xquat[self.cube_body_id].copy(),
             "ee_pos": ee_pos.copy(),
@@ -399,6 +411,12 @@ class PandaGraspEnv(gym.Env):
     def _lift_progress(self, cube_pos):
         lift_height = max(0.0, float(cube_pos[2] - self.initial_cube_z))
         return float(np.clip(lift_height / self.lift_height, 0.0, 1.0))
+
+    def _reach_distance(self):
+        ee_pos, _ = self._get_ee_pose()
+        cube_pos = self.data.xpos[self.cube_body_id].copy()
+        grasp_target_pos = cube_pos + np.array([0.0, 0.0, 0.035], dtype=np.float64)
+        return float(np.linalg.norm(grasp_target_pos - ee_pos))
 
     def _get_ee_pose(self):
         mujoco.mj_forward(self.model, self.data)

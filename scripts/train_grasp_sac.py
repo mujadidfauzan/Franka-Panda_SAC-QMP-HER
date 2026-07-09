@@ -2,6 +2,7 @@ import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
+import re
 
 import numpy as np
 
@@ -14,6 +15,8 @@ from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
 
 from panda_rl.envs import PandaGraspEnv
+
+STEP_PATTERN = re.compile(r"(\d+)")
 
 
 class GraspTensorboardCallback(BaseCallback):
@@ -36,6 +39,7 @@ class GraspTensorboardCallback(BaseCallback):
             "lift_height": "metrics/lift_height",
             "lift_progress": "metrics/lift_progress",
             "action_penalty": "metrics/action_penalty",
+            "auto_gripper_closed": "metrics/auto_gripper_closed",
             "is_success": "metrics/is_success",
         }
 
@@ -71,12 +75,14 @@ class PeriodicArtifactCallback(BaseCallback):
         self.video_fps = video_fps
         self.seed = seed
         self.save_video = save_video
-        self.last_save_step = 0
+        self.last_save_step = None
 
     def _init_callback(self):
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.replay_buffer_dir.mkdir(parents=True, exist_ok=True)
         self.video_dir.mkdir(parents=True, exist_ok=True)
+        if self.last_save_step is None:
+            self.last_save_step = int(getattr(self.model, "num_timesteps", 0))
 
     def _on_step(self):
         if self.num_timesteps - self.last_save_step < self.save_freq:
@@ -87,11 +93,9 @@ class PeriodicArtifactCallback(BaseCallback):
         return True
 
     def _save_artifacts(self, step):
-        step_label = f"{step:010d}"
-        model_path = self.checkpoint_dir / f"sac_panda_grasp_{step_label}_steps.zip"
-        replay_buffer_path = (
-            self.replay_buffer_dir / f"replay_buffer_{step_label}_steps.pkl"
-        )
+        step_label = str(step)
+        model_path = self.checkpoint_dir / f"checkpoint_{step_label}.zip"
+        replay_buffer_path = self.replay_buffer_dir / f"replay_buffer_{step_label}.pkl"
 
         self.model.save(str(model_path))
         self.model.save_replay_buffer(str(replay_buffer_path))
@@ -105,7 +109,7 @@ class PeriodicArtifactCallback(BaseCallback):
             print(f"Saved SAC grasp artifacts at {step} timesteps.")
 
     def _remove_previous_replay_buffers(self, current_path):
-        for replay_path in self.replay_buffer_dir.glob("replay_buffer_*_steps.pkl"):
+        for replay_path in self.replay_buffer_dir.glob("replay_buffer_*.pkl"):
             if replay_path != current_path:
                 replay_path.unlink(missing_ok=True)
 
@@ -149,6 +153,72 @@ def make_env(seed, monitor_dir, randomize_object=True):
     return env
 
 
+def clean_run_name(run_name):
+    if run_name is None:
+        return None
+    return Path(str(run_name)).name.replace(" ", "_")
+
+
+def step_from_path(path):
+    matches = STEP_PATTERN.findall(Path(path).stem)
+    return int(matches[-1]) if matches else -1
+
+
+def latest_file(paths):
+    paths = [Path(path) for path in paths]
+    return max(paths, key=step_from_path) if paths else None
+
+
+def latest_run_dir():
+    candidates = [path for path in (PROJECT_ROOT / "models").glob("*") if path.is_dir()]
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+
+
+def infer_run_name_from_checkpoint(checkpoint_path):
+    path = Path(checkpoint_path).resolve()
+    try:
+        relative = path.relative_to((PROJECT_ROOT / "models").resolve())
+    except ValueError:
+        return None
+    return relative.parts[0] if len(relative.parts) >= 3 else None
+
+
+def resolve_resume_paths(args, run_name):
+    if not (args.resume or args.resume_checkpoint or args.resume_replay_buffer):
+        return None, None, run_name
+
+    checkpoint_path = Path(args.resume_checkpoint) if args.resume_checkpoint else None
+    replay_buffer_path = (
+        Path(args.resume_replay_buffer) if args.resume_replay_buffer else None
+    )
+
+    if checkpoint_path is None:
+        run_dir = PROJECT_ROOT / "models" / run_name if run_name else latest_run_dir()
+        if run_dir is None:
+            raise FileNotFoundError("Tidak ada folder run di models/ untuk resume.")
+        checkpoint_path = latest_file((run_dir / "checkpoints").glob("*.zip"))
+        if checkpoint_path is None:
+            raise FileNotFoundError(f"Tidak ada checkpoint di {run_dir / 'checkpoints'}.")
+        if run_name is None:
+            run_name = run_dir.name
+
+    if run_name is None:
+        run_name = infer_run_name_from_checkpoint(checkpoint_path)
+
+    if replay_buffer_path is None and run_name:
+        replay_buffer_path = latest_file(
+            (PROJECT_ROOT / "models" / run_name / "replay_buffer").glob("*.pkl")
+        )
+
+    if replay_buffer_path is not None and not replay_buffer_path.exists():
+        raise FileNotFoundError(f"Replay buffer tidak ditemukan: {replay_buffer_path}")
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint tidak ditemukan: {checkpoint_path}")
+
+    return checkpoint_path, replay_buffer_path, run_name
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--total-timesteps", type=int, default=2_000_000)
@@ -159,6 +229,28 @@ def parse_args():
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--video-length", type=int, default=250)
     parser.add_argument("--video-fps", type=int, default=50)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume dari checkpoint terbaru. Pakai --run-name untuk memilih run.",
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=str,
+        default=None,
+        help="Path checkpoint .zip tertentu untuk dilanjutkan.",
+    )
+    parser.add_argument(
+        "--resume-replay-buffer",
+        type=str,
+        default=None,
+        help="Path replay buffer .pkl tertentu. Jika kosong, dipakai yang terbaru.",
+    )
+    parser.add_argument(
+        "--fresh-timesteps",
+        action="store_true",
+        help="Reset counter timestep saat resume. Default resume melanjutkan counter.",
+    )
 
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--buffer-size", type=int, default=1_000_000)
@@ -177,7 +269,13 @@ def parse_args():
 def main():
     args = parse_args()
 
-    run_name = args.run_name or datetime.now().strftime("panda_grasp_sac_%Y%m%d_%H%M%S")
+    run_name = clean_run_name(args.run_name)
+    resume_checkpoint, resume_replay_buffer, run_name = resolve_resume_paths(
+        args,
+        run_name,
+    )
+    run_name = run_name or datetime.now().strftime("panda_grasp_sac_%Y%m%d_%H%M%S")
+
     run_log_dir = PROJECT_ROOT / "logs" / run_name
     checkpoint_dir = PROJECT_ROOT / "models" / run_name / "checkpoints"
     replay_buffer_dir = PROJECT_ROOT / "models" / run_name / "replay_buffer"
@@ -193,23 +291,39 @@ def main():
         randomize_object=not args.fixed_object,
     )
 
-    model = SAC(
-        policy="MlpPolicy",
-        env=env,
-        learning_rate=args.learning_rate,
-        buffer_size=args.buffer_size,
-        learning_starts=args.learning_starts,
-        batch_size=args.batch_size,
-        gamma=args.gamma,
-        tau=args.tau,
-        train_freq=args.train_freq,
-        gradient_steps=args.gradient_steps,
-        ent_coef=args.ent_coef,
-        tensorboard_log=str(tensorboard_dir),
-        seed=args.seed,
-        verbose=1,
-        device=args.device,
-    )
+    if resume_checkpoint is not None:
+        model = SAC.load(
+            str(resume_checkpoint),
+            env=env,
+            tensorboard_log=str(tensorboard_dir),
+            device=args.device,
+            verbose=1,
+        )
+        if resume_replay_buffer is not None:
+            model.load_replay_buffer(str(resume_replay_buffer))
+        print(f"Resuming SAC grasp from checkpoint: {resume_checkpoint}")
+        if resume_replay_buffer is not None:
+            print(f"Loaded replay buffer: {resume_replay_buffer}")
+        else:
+            print("Replay buffer tidak ditemukan/dipilih, lanjut tanpa replay buffer lama.")
+    else:
+        model = SAC(
+            policy="MlpPolicy",
+            env=env,
+            learning_rate=args.learning_rate,
+            buffer_size=args.buffer_size,
+            learning_starts=args.learning_starts,
+            batch_size=args.batch_size,
+            gamma=args.gamma,
+            tau=args.tau,
+            train_freq=args.train_freq,
+            gradient_steps=args.gradient_steps,
+            ent_coef=args.ent_coef,
+            tensorboard_log=str(tensorboard_dir),
+            seed=args.seed,
+            verbose=1,
+            device=args.device,
+        )
 
     callbacks = CallbackList(
         [
@@ -233,6 +347,7 @@ def main():
             callback=callbacks,
             log_interval=args.log_interval,
             tb_log_name=run_name,
+            reset_num_timesteps=(resume_checkpoint is None or args.fresh_timesteps),
             progress_bar=False,
         )
     finally:
