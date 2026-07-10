@@ -21,15 +21,11 @@
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
 
-    <body name="cube" pos="0.48 0 0.025">
+    <body name="cube" pos="0.48 0 0.02">
       <freejoint name="cube_freejoint"/>
-      <geom name="cube_geom" type="box" size="0.025 0.025 0.025" material="cube_blue"
+      <geom name="cube_geom" type="box" size="0.02 0.02 0.02" material="cube_blue"
         mass="0.04" friction="1.2 0.01 0.001" condim="4"/>
       <site name="cube_site" type="sphere" size="0.008" rgba="1 1 0 1"/>
-    </body>
-
-    <body name="lift_target_body" mocap="true" pos="0.48 0 0.075">
-      <site name="lift_target_site" type="sphere" size="0.018" rgba="0 1 0 0.75"/>
     </body>
   </worldbody>
 </mujoco>

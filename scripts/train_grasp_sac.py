@@ -1,10 +1,14 @@
 import argparse
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 import re
 
 import numpy as np
+
+if "MUJOCO_GL" not in os.environ and not os.environ.get("DISPLAY"):
+    os.environ["MUJOCO_GL"] = "egl"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -103,7 +107,10 @@ class PeriodicArtifactCallback(BaseCallback):
 
         if self.save_video:
             video_path = self.video_dir / f"eval_{step_label}_steps.mp4"
-            self._save_eval_video(video_path, seed=self.seed + int(step))
+            try:
+                self._save_eval_video(video_path, seed=self.seed + int(step))
+            except Exception as exc:
+                print(f"Skipping eval video at {step} timesteps: {exc}")
 
         if self.verbose:
             print(f"Saved SAC grasp artifacts at {step} timesteps.")

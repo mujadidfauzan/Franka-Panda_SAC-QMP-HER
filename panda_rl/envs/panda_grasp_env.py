@@ -38,8 +38,6 @@ GRIPPER_ACTUATOR_NAME = "actuator8"
 CUBE_BODY_NAME = "cube"
 CUBE_JOINT_NAME = "cube_freejoint"
 CUBE_SITE_NAME = "cube_site"
-LIFT_TARGET_BODY_NAME = "lift_target_body"
-LIFT_TARGET_SITE_NAME = "lift_target_site"
 
 
 class PandaGraspEnv(gym.Env):
@@ -126,20 +124,6 @@ class PandaGraspEnv(gym.Env):
         self.cube_qpos_id = self.model.jnt_qposadr[self.cube_joint_id]
         self.cube_dof_id = self.model.jnt_dofadr[self.cube_joint_id]
 
-        self.lift_target_body_id = mj_name_to_id(
-            self.model,
-            mujoco.mjtObj.mjOBJ_BODY,
-            LIFT_TARGET_BODY_NAME,
-        )
-        self.lift_target_site_id = mj_name_to_id(
-            self.model,
-            mujoco.mjtObj.mjOBJ_SITE,
-            LIFT_TARGET_SITE_NAME,
-        )
-        self.lift_target_mocap_id = self.model.body_mocapid[self.lift_target_body_id]
-        if self.lift_target_mocap_id == -1:
-            raise ValueError(f"Body '{LIFT_TARGET_BODY_NAME}' must be a mocap body.")
-
         self.ik_controller = DifferentialIK6DController(
             model=self.model,
             site_name=self.ee_site_name,
@@ -165,9 +149,9 @@ class PandaGraspEnv(gym.Env):
             dtype=np.float32,
         )
 
-        self.default_cube_pos = np.array([0.48, 0.0, 0.025], dtype=np.float64)
-        self.object_pos_low = np.array([0.40, -0.18, 0.025], dtype=np.float64)
-        self.object_pos_high = np.array([0.58, 0.18, 0.025], dtype=np.float64)
+        self.default_cube_pos = np.array([0.48, 0.0, 0.02], dtype=np.float64)
+        self.object_pos_low = np.array([0.30, -0.35, 0.02], dtype=np.float64)
+        self.object_pos_high = np.array([0.72, 0.35, 0.02], dtype=np.float64)
         self.command_pos_low = np.array([0.25, -0.45, 0.05], dtype=np.float64)
         self.command_pos_high = np.array([0.75, 0.45, 0.75], dtype=np.float64)
 
@@ -273,15 +257,7 @@ class PandaGraspEnv(gym.Env):
             [0.0, 0.0, self.lift_height],
             dtype=np.float64,
         )
-        self._sync_lift_target_marker()
         mujoco.mj_forward(self.model, self.data)
-
-    def _sync_lift_target_marker(self):
-        self.data.mocap_pos[self.lift_target_mocap_id] = self.lift_target_pos
-        self.data.mocap_quat[self.lift_target_mocap_id] = np.array(
-            [1.0, 0.0, 0.0, 0.0],
-            dtype=np.float64,
-        )
 
     def _apply_cartesian_action(self, pose_action):
         delta_pos = pose_action[:3] * self.cartesian_scale
@@ -334,8 +310,7 @@ class PandaGraspEnv(gym.Env):
         ee_pos, ee_mat = self._get_ee_pose()
         cube_pos = self.data.xpos[self.cube_body_id].copy()
         cube_quat = self.data.xquat[self.cube_body_id].copy()
-        grasp_target_pos = cube_pos + np.array([0.0, 0.0, 0.035], dtype=np.float64)
-        object_to_ee = grasp_target_pos - ee_pos
+        object_to_ee = cube_pos - ee_pos
         lift_error = self.lift_target_pos - cube_pos
         lift_progress = self._lift_progress(cube_pos)
 
@@ -415,8 +390,7 @@ class PandaGraspEnv(gym.Env):
     def _reach_distance(self):
         ee_pos, _ = self._get_ee_pose()
         cube_pos = self.data.xpos[self.cube_body_id].copy()
-        grasp_target_pos = cube_pos + np.array([0.0, 0.0, 0.035], dtype=np.float64)
-        return float(np.linalg.norm(grasp_target_pos - ee_pos))
+        return float(np.linalg.norm(cube_pos - ee_pos))
 
     def _get_ee_pose(self):
         mujoco.mj_forward(self.model, self.data)
