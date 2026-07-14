@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os
 import re
 import sys
@@ -74,11 +75,33 @@ class QMPHERTensorboardCallback(BaseCallback):
         for name, q_value in getattr(self.model, "qmp_last_q_values", {}).items():
             self.logger.record(f"qmp/q_{name}", float(q_value))
 
+        object_held = getattr(self.model, "qmp_last_object_held", [])
+        if object_held:
+            self.logger.record("qmp/object_held", float(np.mean(object_held)))
+        self.logger.record(
+            "qmp/gate_active",
+            float(getattr(self.model, "qmp_last_gate_active", False)),
+        )
+        self.logger.record(
+            "qmp/primitive_only_active",
+            float(getattr(self.model, "qmp_last_primitive_only_active", False)),
+        )
+        commitment_remaining = getattr(
+            self.model,
+            "qmp_last_commitment_remaining",
+            [],
+        )
+        if commitment_remaining:
+            self.logger.record(
+                "qmp/commitment_remaining",
+                float(np.mean(commitment_remaining)),
+            )
+
         return True
 
 
 class PeriodicArtifactCallback(BaseCallback):
-    """Save target model, one rolling HER replay buffer, and target-policy eval video."""
+    """Save target model, one rolling HER buffer, and annotated QMP eval video."""
 
     def __init__(
         self,
@@ -147,9 +170,10 @@ class PeriodicArtifactCallback(BaseCallback):
     def _save_eval_video(self, video_path, seed):
         try:
             import imageio.v2 as imageio
+            from PIL import Image, ImageDraw, ImageFont
         except ImportError as exc:
             raise ImportError(
-                "Video saving requires imageio with ffmpeg support. "
+                "Annotated video saving requires imageio, ffmpeg, and Pillow. "
                 "Install dependencies from requirements.txt."
             ) from exc
 
@@ -160,26 +184,171 @@ class PeriodicArtifactCallback(BaseCallback):
             terminate_on_success=self.terminate_on_success,
         )
         frames = []
+        selector_state = self._capture_qmp_selector_state()
+        numpy_random_state = np.random.get_state()
 
         try:
-            obs, _ = eval_env.reset(seed=seed)
+            self._reset_qmp_selector_for_eval()
+            obs, info = eval_env.reset(seed=seed)
             first_frame = eval_env.render()
             if first_frame is not None:
-                frames.append(first_frame)
+                frames.append(
+                    self._annotate_eval_frame(
+                        first_frame,
+                        {
+                            "selected_policy": "reset",
+                            "q_values": {},
+                            "gate_active": self.num_timesteps
+                            < self.model.qmp_gate_steps,
+                            "primitive_only_active": self.num_timesteps
+                            < self.model.qmp_primitive_only_steps,
+                            "object_held": False,
+                            "commitment_remaining": 0,
+                        },
+                        eval_step=0,
+                        training_step=self.num_timesteps,
+                        reward=0.0,
+                        info=info,
+                        image_types=(Image, ImageDraw, ImageFont),
+                    )
+                )
 
-            for _ in range(self.video_length):
-                action, _ = self.model.predict(obs, deterministic=True)
-                obs, _, terminated, truncated, _ = eval_env.step(action)
+            for eval_step in range(1, self.video_length + 1):
+                action, diagnostics = self.model.predict_qmp(
+                    obs,
+                    deterministic=True,
+                    episode_start=eval_step == 1,
+                )
+                obs, reward, terminated, truncated, info = eval_env.step(action)
                 frame = eval_env.render()
                 if frame is not None:
-                    frames.append(frame)
+                    frames.append(
+                        self._annotate_eval_frame(
+                            frame,
+                            diagnostics,
+                            eval_step=eval_step,
+                            training_step=self.num_timesteps,
+                            reward=reward,
+                            info=info,
+                            image_types=(Image, ImageDraw, ImageFont),
+                        )
+                    )
                 if terminated or truncated:
                     break
         finally:
+            np.random.set_state(numpy_random_state)
+            self._restore_qmp_selector_state(selector_state)
             eval_env.close()
 
         if frames:
             imageio.mimsave(video_path, frames, fps=self.video_fps)
+
+    def _capture_qmp_selector_state(self):
+        attribute_names = (
+            "_last_obs",
+            "_last_episode_starts",
+            "_qmp_committed_names",
+            "_qmp_commitment_remaining",
+            "_qmp_was_primitive_only",
+            "qmp_last_selected_names",
+            "qmp_last_q_values",
+            "qmp_last_candidate_names",
+            "qmp_last_object_held",
+            "qmp_last_gate_active",
+            "qmp_last_primitive_only_active",
+            "qmp_last_commitment_remaining",
+        )
+        return {
+            name: copy.deepcopy(getattr(self.model, name))
+            for name in attribute_names
+        }
+
+    def _restore_qmp_selector_state(self, state):
+        for name, value in state.items():
+            setattr(self.model, name, value)
+
+    def _reset_qmp_selector_for_eval(self):
+        self.model._qmp_committed_names = []
+        self.model._qmp_commitment_remaining = np.zeros(0, dtype=np.int64)
+        self.model._qmp_was_primitive_only = False
+
+    @staticmethod
+    def _annotate_eval_frame(
+        frame,
+        diagnostics,
+        eval_step,
+        training_step,
+        reward,
+        info,
+        image_types,
+    ):
+        Image, ImageDraw, ImageFont = image_types
+        image = Image.fromarray(np.asarray(frame, dtype=np.uint8)).convert("RGBA")
+        overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        font_size = max(13, min(18, image.width // 42))
+        try:
+            font = ImageFont.truetype("DejaVuSansMono.ttf", font_size)
+            bold_font = ImageFont.truetype("DejaVuSansMono-Bold.ttf", font_size)
+        except OSError:
+            font = ImageFont.load_default()
+            bold_font = font
+
+        selected_policy = diagnostics.get("selected_policy", "unknown")
+        q_values = diagnostics.get("q_values", {})
+
+        def format_q(policy_name):
+            value = q_values.get(policy_name)
+            return "N/A" if value is None else f"{float(value):+.4f}"
+
+        selected_q = format_q(selected_policy)
+        phase = "GATED PRIMITIVES" if diagnostics.get("gate_active") else "Q SELECT"
+        held = "YES" if diagnostics.get("object_held") else "NO"
+        commitment = int(diagnostics.get("commitment_remaining", 0))
+        insert_distance = float(info.get("insert_distance", np.nan))
+        lines = [
+            f"Eval step {eval_step:03d} | train {int(training_step):d}",
+            f"Selected: {selected_policy.upper()} | Q: {selected_q}",
+            f"Q target {format_q('target')} | grasp {format_q('grasp')}",
+            f"Q insert {format_q('insert')}",
+            f"Mode: {phase} | held: {held} | commit: {commitment}",
+            f"Reward: {float(reward):+.2f} | insert dist: {insert_distance:.4f} m",
+        ]
+
+        padding = 10
+        line_gap = 4
+        boxes = [draw.textbbox((0, 0), line, font=font) for line in lines]
+        text_width = max(box[2] - box[0] for box in boxes)
+        line_height = max(box[3] - box[1] for box in boxes)
+        panel_width = min(image.width - 16, text_width + 2 * padding)
+        panel_height = len(lines) * line_height + (len(lines) - 1) * line_gap + 2 * padding
+        panel_xy = (8, 8, 8 + panel_width, 8 + panel_height)
+        draw.rectangle(panel_xy, fill=(8, 12, 18, 210), outline=(235, 235, 235, 180))
+
+        policy_colors = {
+            "target": (80, 210, 255, 255),
+            "grasp": (90, 235, 130, 255),
+            "insert": (255, 190, 70, 255),
+            "random": (255, 100, 100, 255),
+            "reset": (220, 220, 220, 255),
+        }
+        y = 8 + padding
+        for line_index, line in enumerate(lines):
+            color = (
+                policy_colors.get(selected_policy, (255, 255, 255, 255))
+                if line_index == 1
+                else (245, 245, 245, 255)
+            )
+            draw.text(
+                (8 + padding, y),
+                line,
+                font=bold_font if line_index == 1 else font,
+                fill=color,
+            )
+            y += line_height + line_gap
+
+        return np.asarray(Image.alpha_composite(image, overlay).convert("RGB"))
 
 
 def make_env(args, seed, monitor_dir, terminate_on_success):
@@ -355,6 +524,16 @@ def build_primitive_policies(args):
     if not primitives:
         raise ValueError("Minimal satu primitive harus aktif untuk QMP-HER.")
 
+    if args.primitive_gate_steps > 0:
+        primitive_names = {primitive.name for primitive in primitives}
+        missing_names = {"grasp", "insert"} - primitive_names
+        if missing_names:
+            missing = ", ".join(sorted(missing_names))
+            raise ValueError(
+                "Primitive gating membutuhkan model grasp dan insert. "
+                f"Primitive yang belum tersedia: {missing}."
+            )
+
     return primitives
 
 
@@ -381,6 +560,13 @@ def parse_args():
     parser.add_argument("--grasp-close-distance", type=float, default=0.01)
     parser.add_argument("--qmp-epsilon", type=float, default=0.05)
     parser.add_argument("--qmp-warmup-steps", type=int, default=None)
+    parser.add_argument("--primitive-only-steps", type=int, default=500_000)
+    parser.add_argument("--primitive-gate-steps", type=int, default=500_000)
+    parser.add_argument("--primitive-commitment-min-steps", type=int, default=10)
+    parser.add_argument("--primitive-commitment-max-steps", type=int, default=30)
+    parser.add_argument("--held-min-lift-height", type=float, default=0.01)
+    parser.add_argument("--held-max-ee-distance", type=float, default=0.06)
+    parser.add_argument("--held-max-gripper-qpos", type=float, default=0.03)
     parser.add_argument("--her-n-sampled-goal", type=int, default=4)
     parser.add_argument("--her-goal-selection-strategy", type=str, default="future")
     parser.add_argument(
@@ -422,6 +608,17 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.primitive_gate_steps > args.primitive_only_steps:
+        raise ValueError(
+            "--primitive-gate-steps cannot exceed --primitive-only-steps."
+        )
+    if args.primitive_commitment_min_steps < 1:
+        raise ValueError("--primitive-commitment-min-steps must be at least 1.")
+    if args.primitive_commitment_max_steps < args.primitive_commitment_min_steps:
+        raise ValueError(
+            "--primitive-commitment-max-steps must be greater than or equal to "
+            "--primitive-commitment-min-steps."
+        )
 
     run_name = clean_run_name(args.run_name)
     resume_checkpoint, resume_replay_buffer, run_name = resolve_resume_paths(
@@ -450,6 +647,14 @@ def main():
         terminate_on_success=terminate_on_success,
     )
     primitive_policies = build_primitive_policies(args)
+    print(
+        "QMP schedule: "
+        f"primitive-only for {args.primitive_only_steps} steps, "
+        f"grasp/insert gate for {args.primitive_gate_steps} steps, "
+        "then target + grasp + insert candidates; "
+        f"primitive commitment {args.primitive_commitment_min_steps}-"
+        f"{args.primitive_commitment_max_steps} steps."
+    )
 
     if resume_checkpoint is not None:
         model = QMPSAC.load(
@@ -460,6 +665,13 @@ def main():
             primitive_policies=primitive_policies,
             qmp_warmup_steps=qmp_warmup_steps,
             qmp_epsilon=args.qmp_epsilon,
+            qmp_primitive_only_steps=args.primitive_only_steps,
+            qmp_gate_steps=args.primitive_gate_steps,
+            qmp_commitment_min_steps=args.primitive_commitment_min_steps,
+            qmp_commitment_max_steps=args.primitive_commitment_max_steps,
+            qmp_held_min_lift_height=args.held_min_lift_height,
+            qmp_held_max_ee_distance=args.held_max_ee_distance,
+            qmp_held_max_gripper_qpos=args.held_max_gripper_qpos,
             verbose=1,
         )
         if resume_replay_buffer is not None:
@@ -476,6 +688,13 @@ def main():
             primitive_policies=primitive_policies,
             qmp_warmup_steps=qmp_warmup_steps,
             qmp_epsilon=args.qmp_epsilon,
+            qmp_primitive_only_steps=args.primitive_only_steps,
+            qmp_gate_steps=args.primitive_gate_steps,
+            qmp_commitment_min_steps=args.primitive_commitment_min_steps,
+            qmp_commitment_max_steps=args.primitive_commitment_max_steps,
+            qmp_held_min_lift_height=args.held_min_lift_height,
+            qmp_held_max_ee_distance=args.held_max_ee_distance,
+            qmp_held_max_gripper_qpos=args.held_max_gripper_qpos,
             learning_rate=args.learning_rate,
             buffer_size=args.buffer_size,
             learning_starts=args.learning_starts,
