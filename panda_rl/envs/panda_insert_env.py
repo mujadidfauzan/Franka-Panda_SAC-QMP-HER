@@ -224,7 +224,8 @@ class PandaInsertEnv(gym.Env):
         obs = self._get_obs()
         reward, reward_info = self._compute_reward(action)
 
-        terminated = bool(reward_info["is_success"] and self.terminate_on_success)
+        # terminated = bool(reward_info["is_success"] and self.terminate_on_success)
+        terminated = False
         truncated = self.current_step >= self.max_steps
         info = self._get_info(**reward_info)
 

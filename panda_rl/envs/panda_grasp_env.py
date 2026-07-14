@@ -51,10 +51,10 @@ class PandaGraspEnv(gym.Env):
         model_path=None,
         randomize_object=True,
         frame_skip=10,
-        max_steps=250,
+        max_steps=300,
         cartesian_scale=0.03,
         rotation_scale=0.10,
-        lift_height=0.05,
+        lift_height=0.03,
         success_bonus=25.0,
         close_bonus=2.0,
         close_bonus_distance=0.01,
@@ -151,8 +151,8 @@ class PandaGraspEnv(gym.Env):
 
         self.default_cube_pos = np.array([0.48, 0.0, 0.02], dtype=np.float64)
         self.object_pos_low = np.array([0.30, -0.35, 0.02], dtype=np.float64)
-        self.object_pos_high = np.array([0.72, 0.35, 0.02], dtype=np.float64)
-        self.command_pos_low = np.array([0.25, -0.45, 0.05], dtype=np.float64)
+        self.object_pos_high = np.array([0.60,0.35,0.02], dtype=np.float64)
+        self.command_pos_low = np.array([0.25, -0.45, 0.00], dtype=np.float64)
         self.command_pos_high = np.array([0.75, 0.45, 0.75], dtype=np.float64)
 
         self.current_step = 0
@@ -202,7 +202,7 @@ class PandaGraspEnv(gym.Env):
         obs = self._get_obs()
         reward, reward_info = self._compute_reward(action)
 
-        terminated = reward_info["is_success"]
+        terminated = False
         truncated = self.current_step >= self.max_steps
         info = self._get_info(**reward_info)
 
@@ -340,14 +340,14 @@ class PandaGraspEnv(gym.Env):
         action_penalty = self.action_penalty_weight * np.sum(np.square(action))
 
         is_success = lift_height >= self.lift_height
-        reward_reach = -2.0 * reach_distance
+        reward_reach = -5.0 * reach_distance
         reward_lift = self.success_bonus if is_success else 0.0
         reward_close_bonus = (
             self.close_bonus if reach_distance <= self.close_bonus_distance else 0.0
         )
         reward_success_bonus = reward_lift
 
-        reward = reward_reach + reward_lift + reward_close_bonus
+        reward = reward_reach  + reward_close_bonus + reward_lift
 
         return float(reward), {
             "reach_distance": float(reach_distance),
