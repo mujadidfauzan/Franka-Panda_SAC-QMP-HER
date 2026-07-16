@@ -86,6 +86,16 @@ class QMPHERTensorboardCallback(BaseCallback):
             "qmp/primitive_only_active",
             float(getattr(self.model, "qmp_last_primitive_only_active", False)),
         )
+        target_margin_fallback = getattr(
+            self.model,
+            "qmp_last_target_margin_fallback",
+            [],
+        )
+        if target_margin_fallback:
+            self.logger.record(
+                "qmp/target_margin_fallback",
+                float(np.mean(target_margin_fallback)),
+            )
         commitment_remaining = getattr(
             self.model,
             "qmp_last_commitment_remaining",
@@ -114,6 +124,7 @@ class PeriodicArtifactCallback(BaseCallback):
         seed=0,
         save_video=True,
         terminate_on_success=True,
+        sparse_reward_mode="negative",
         verbose=1,
     ):
         super().__init__(verbose=verbose)
@@ -126,6 +137,7 @@ class PeriodicArtifactCallback(BaseCallback):
         self.seed = seed
         self.save_video = save_video
         self.terminate_on_success = terminate_on_success
+        self.sparse_reward_mode = sparse_reward_mode
         self.last_save_step = None
 
     def _init_callback(self):
@@ -182,6 +194,7 @@ class PeriodicArtifactCallback(BaseCallback):
             randomize_object=True,
             randomize_socket=True,
             terminate_on_success=self.terminate_on_success,
+            sparse_reward_mode=self.sparse_reward_mode,
         )
         frames = []
         selector_state = self._capture_qmp_selector_state()
@@ -257,6 +270,8 @@ class PeriodicArtifactCallback(BaseCallback):
             "qmp_last_gate_active",
             "qmp_last_primitive_only_active",
             "qmp_last_commitment_remaining",
+            "qmp_last_valid_candidate_names",
+            "qmp_last_target_margin_fallback",
         )
         return {
             name: copy.deepcopy(getattr(self.model, name))
@@ -306,6 +321,8 @@ class PeriodicArtifactCallback(BaseCallback):
         phase = "GATED PRIMITIVES" if diagnostics.get("gate_active") else "Q SELECT"
         held = "YES" if diagnostics.get("object_held") else "NO"
         commitment = int(diagnostics.get("commitment_remaining", 0))
+        valid_candidates = ",".join(diagnostics.get("valid_candidates", [])) or "N/A"
+        margin_fallback = "YES" if diagnostics.get("target_margin_fallback") else "NO"
         insert_distance = float(info.get("insert_distance", np.nan))
         lines = [
             f"Eval step {eval_step:03d} | train {int(training_step):d}",
@@ -313,6 +330,7 @@ class PeriodicArtifactCallback(BaseCallback):
             f"Q target {format_q('target')} | grasp {format_q('grasp')}",
             f"Q insert {format_q('insert')}",
             f"Mode: {phase} | held: {held} | commit: {commitment}",
+            f"Valid: {valid_candidates} | Q fallback: {margin_fallback}",
             f"Reward: {float(reward):+.2f} | insert dist: {insert_distance:.4f} m",
         ]
 
@@ -358,6 +376,7 @@ def make_env(args, seed, monitor_dir, terminate_on_success):
         max_steps=args.max_steps,
         insert_tolerance=args.insert_tolerance,
         success_bonus=args.success_bonus,
+        sparse_reward_mode=args.sparse_reward_mode,
         terminate_on_success=terminate_on_success,
     )
     env = Monitor(env, filename=str(monitor_dir / "monitor.csv"))
@@ -556,6 +575,11 @@ def parse_args():
     parser.add_argument("--video-fps", type=int, default=50)
     parser.add_argument("--insert-tolerance", type=float, default=0.01)
     parser.add_argument("--success-bonus", type=float, default=1.0)
+    parser.add_argument(
+        "--sparse-reward-mode",
+        choices=("negative", "positive"),
+        default="negative",
+    )
     parser.add_argument("--grasp-lift-height", type=float, default=0.03)
     parser.add_argument("--grasp-close-distance", type=float, default=0.01)
     parser.add_argument("--qmp-epsilon", type=float, default=0.05)
@@ -567,6 +591,13 @@ def parse_args():
     parser.add_argument("--held-min-lift-height", type=float, default=0.01)
     parser.add_argument("--held-max-ee-distance", type=float, default=0.06)
     parser.add_argument("--held-max-gripper-qpos", type=float, default=0.03)
+    parser.add_argument("--no-stage-aware-mask", action="store_true")
+    parser.add_argument("--target-q-margin", type=float, default=0.05)
+    parser.add_argument("--bc-steps", type=int, default=500_000)
+    parser.add_argument("--bc-coef", type=float, default=1.0)
+    parser.add_argument("--bc-batch-size", type=int, default=256)
+    parser.add_argument("--bc-buffer-size", type=int, default=100_000)
+    parser.add_argument("--no-behavior-cloning", action="store_true")
     parser.add_argument("--her-n-sampled-goal", type=int, default=4)
     parser.add_argument("--her-goal-selection-strategy", type=str, default="future")
     parser.add_argument(
@@ -619,6 +650,12 @@ def main():
             "--primitive-commitment-max-steps must be greater than or equal to "
             "--primitive-commitment-min-steps."
         )
+    if args.target_q_margin < 0.0:
+        raise ValueError("--target-q-margin must be non-negative.")
+    if args.bc_steps < 0 or args.bc_coef < 0.0:
+        raise ValueError("--bc-steps and --bc-coef must be non-negative.")
+    if args.bc_batch_size < 1 or args.bc_buffer_size < 1:
+        raise ValueError("--bc-batch-size and --bc-buffer-size must be positive.")
 
     run_name = clean_run_name(args.run_name)
     resume_checkpoint, resume_replay_buffer, run_name = resolve_resume_paths(
@@ -636,6 +673,7 @@ def main():
     qmp_warmup_steps = (
         args.learning_starts if args.qmp_warmup_steps is None else args.qmp_warmup_steps
     )
+    qmp_bc_coef = 0.0 if args.no_behavior_cloning else args.bc_coef
 
     run_log_dir.mkdir(parents=True, exist_ok=True)
     tensorboard_dir.mkdir(parents=True, exist_ok=True)
@@ -651,9 +689,12 @@ def main():
         "QMP schedule: "
         f"primitive-only for {args.primitive_only_steps} steps, "
         f"grasp/insert gate for {args.primitive_gate_steps} steps, "
-        "then target + grasp + insert candidates; "
+        "then stage-masked target + primitive candidates; "
         f"primitive commitment {args.primitive_commitment_min_steps}-"
-        f"{args.primitive_commitment_max_steps} steps."
+        f"{args.primitive_commitment_max_steps} steps; "
+        f"target Q margin {args.target_q_margin}; "
+        f"BC coef {qmp_bc_coef} through {args.bc_steps} steps; "
+        f"reward mode {args.sparse_reward_mode}."
     )
 
     if resume_checkpoint is not None:
@@ -672,6 +713,12 @@ def main():
             qmp_held_min_lift_height=args.held_min_lift_height,
             qmp_held_max_ee_distance=args.held_max_ee_distance,
             qmp_held_max_gripper_qpos=args.held_max_gripper_qpos,
+            qmp_stage_aware_mask=not args.no_stage_aware_mask,
+            qmp_target_q_margin=args.target_q_margin,
+            qmp_bc_steps=args.bc_steps,
+            qmp_bc_coef=qmp_bc_coef,
+            qmp_bc_batch_size=args.bc_batch_size,
+            qmp_bc_buffer_size=args.bc_buffer_size,
             verbose=1,
         )
         if resume_replay_buffer is not None:
@@ -695,6 +742,12 @@ def main():
             qmp_held_min_lift_height=args.held_min_lift_height,
             qmp_held_max_ee_distance=args.held_max_ee_distance,
             qmp_held_max_gripper_qpos=args.held_max_gripper_qpos,
+            qmp_stage_aware_mask=not args.no_stage_aware_mask,
+            qmp_target_q_margin=args.target_q_margin,
+            qmp_bc_steps=args.bc_steps,
+            qmp_bc_coef=qmp_bc_coef,
+            qmp_bc_batch_size=args.bc_batch_size,
+            qmp_bc_buffer_size=args.bc_buffer_size,
             learning_rate=args.learning_rate,
             buffer_size=args.buffer_size,
             learning_starts=args.learning_starts,
@@ -728,6 +781,7 @@ def main():
                 seed=args.seed,
                 save_video=not args.no_video,
                 terminate_on_success=terminate_on_success,
+                sparse_reward_mode=args.sparse_reward_mode,
             ),
         ]
     )

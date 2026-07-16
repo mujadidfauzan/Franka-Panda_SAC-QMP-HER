@@ -125,6 +125,12 @@ class QMPSAC(SAC):
         qmp_held_min_lift_height: float = 0.01,
         qmp_held_max_ee_distance: float = 0.06,
         qmp_held_max_gripper_qpos: float = 0.03,
+        qmp_stage_aware_mask: bool = True,
+        qmp_target_q_margin: float = 0.05,
+        qmp_bc_steps: int = 500_000,
+        qmp_bc_coef: float = 1.0,
+        qmp_bc_batch_size: int = 256,
+        qmp_bc_buffer_size: int = 100_000,
         **kwargs,
     ):
         self.primitive_policies = list(primitive_policies or [])
@@ -137,6 +143,12 @@ class QMPSAC(SAC):
         self.qmp_held_min_lift_height = float(qmp_held_min_lift_height)
         self.qmp_held_max_ee_distance = float(qmp_held_max_ee_distance)
         self.qmp_held_max_gripper_qpos = float(qmp_held_max_gripper_qpos)
+        self.qmp_stage_aware_mask = bool(qmp_stage_aware_mask)
+        self.qmp_target_q_margin = float(qmp_target_q_margin)
+        self.qmp_bc_steps = int(qmp_bc_steps)
+        self.qmp_bc_coef = float(qmp_bc_coef)
+        self.qmp_bc_batch_size = int(qmp_bc_batch_size)
+        self.qmp_bc_buffer_size = int(qmp_bc_buffer_size)
         if self.qmp_commitment_min_steps < 1:
             raise ValueError("qmp_commitment_min_steps must be at least 1.")
         if self.qmp_commitment_max_steps < self.qmp_commitment_min_steps:
@@ -144,6 +156,12 @@ class QMPSAC(SAC):
                 "qmp_commitment_max_steps must be greater than or equal to "
                 "qmp_commitment_min_steps."
             )
+        if self.qmp_target_q_margin < 0.0:
+            raise ValueError("qmp_target_q_margin must be non-negative.")
+        if self.qmp_bc_steps < 0 or self.qmp_bc_coef < 0.0:
+            raise ValueError("QMP behavior cloning steps and coefficient must be non-negative.")
+        if self.qmp_bc_batch_size < 1 or self.qmp_bc_buffer_size < 1:
+            raise ValueError("QMP behavior cloning batch and buffer sizes must be positive.")
 
         self.qmp_last_selected_names = []
         self.qmp_last_q_values = {}
@@ -152,13 +170,35 @@ class QMPSAC(SAC):
         self.qmp_last_gate_active = False
         self.qmp_last_primitive_only_active = False
         self.qmp_last_commitment_remaining = []
+        self.qmp_last_valid_candidate_names = []
+        self.qmp_last_target_margin_fallback = []
+        self.qmp_last_bc_loss = np.nan
         self._qmp_committed_names = []
         self._qmp_commitment_remaining = np.zeros(0, dtype=np.int64)
         self._qmp_was_primitive_only = False
+        self._qmp_bc_observations = None
+        self._qmp_bc_actions = None
+        self._qmp_bc_position = 0
+        self._qmp_bc_full = False
         super().__init__(*args, **kwargs)
 
     def _excluded_save_params(self):
-        return super()._excluded_save_params() + ["primitive_policies"]
+        return super()._excluded_save_params() + [
+            "primitive_policies",
+            "_qmp_bc_observations",
+            "_qmp_bc_actions",
+            "_qmp_bc_position",
+            "_qmp_bc_full",
+        ]
+
+    def train(self, gradient_steps, batch_size=64):
+        super().train(gradient_steps, batch_size)
+        if (
+            self.qmp_bc_coef > 0.0
+            and self.num_timesteps < self.qmp_bc_steps
+            and self._qmp_bc_size() >= self.qmp_bc_batch_size
+        ):
+            self._train_behavior_clone()
 
     def _sample_action(self, learning_starts, action_noise=None, n_envs=1):
         selected_action = self._select_qmp_action(
@@ -172,11 +212,114 @@ class QMPSAC(SAC):
             return super()._sample_action(learning_starts, action_noise, n_envs)
 
         scaled_action = self.policy.scale_action(selected_action)
+        primitive_names = {primitive.name for primitive in self.primitive_policies}
+        primitive_mask = np.asarray(
+            [name in primitive_names for name in self.qmp_last_selected_names],
+            dtype=bool,
+        )
+        if self.num_timesteps < self.qmp_bc_steps and np.any(primitive_mask):
+            self._store_behavior_clone_samples(
+                self._last_obs,
+                scaled_action,
+                primitive_mask,
+            )
         if action_noise is not None:
             scaled_action = np.clip(scaled_action + action_noise(), -1.0, 1.0)
             selected_action = self.policy.unscale_action(scaled_action)
 
         return selected_action, scaled_action
+
+    def _store_behavior_clone_samples(self, observations, actions, sample_mask):
+        observation_batch = self._numpy_observation_batch(observations)
+        actions = self._ensure_action_batch(actions, len(sample_mask))
+
+        if self._qmp_bc_observations is None:
+            self._qmp_bc_position = 0
+            self._qmp_bc_full = False
+            if isinstance(observation_batch, dict):
+                self._qmp_bc_observations = {
+                    key: np.empty(
+                        (self.qmp_bc_buffer_size, *value.shape[1:]),
+                        dtype=np.float32,
+                    )
+                    for key, value in observation_batch.items()
+                }
+            else:
+                self._qmp_bc_observations = np.empty(
+                    (self.qmp_bc_buffer_size, *observation_batch.shape[1:]),
+                    dtype=np.float32,
+                )
+            self._qmp_bc_actions = np.empty(
+                (self.qmp_bc_buffer_size, actions.shape[1]),
+                dtype=np.float32,
+            )
+
+        for env_index in np.flatnonzero(sample_mask):
+            position = self._qmp_bc_position
+            if isinstance(observation_batch, dict):
+                for key, value in observation_batch.items():
+                    self._qmp_bc_observations[key][position] = value[env_index]
+            else:
+                self._qmp_bc_observations[position] = observation_batch[env_index]
+            self._qmp_bc_actions[position] = actions[env_index]
+
+            self._qmp_bc_position = (position + 1) % self.qmp_bc_buffer_size
+            if self._qmp_bc_position == 0:
+                self._qmp_bc_full = True
+
+    def _train_behavior_clone(self):
+        buffer_size = self._qmp_bc_size()
+        indices = np.random.randint(
+            0,
+            buffer_size,
+            size=self.qmp_bc_batch_size,
+        )
+        if isinstance(self._qmp_bc_observations, dict):
+            observation_tensor = {
+                key: th.as_tensor(value[indices], device=self.device)
+                for key, value in self._qmp_bc_observations.items()
+            }
+        else:
+            observation_tensor = th.as_tensor(
+                self._qmp_bc_observations[indices],
+                device=self.device,
+            )
+        expert_actions = th.as_tensor(
+            self._qmp_bc_actions[indices],
+            device=self.device,
+        )
+
+        predicted_actions = self.actor(observation_tensor, deterministic=True)
+        bc_loss = th.nn.functional.mse_loss(predicted_actions, expert_actions)
+        self.actor.optimizer.zero_grad()
+        (self.qmp_bc_coef * bc_loss).backward()
+        self.actor.optimizer.step()
+
+        self.qmp_last_bc_loss = float(bc_loss.detach().cpu().item())
+        self.logger.record("train/qmp_bc_loss", self.qmp_last_bc_loss)
+        self.logger.record("train/qmp_bc_coef", self.qmp_bc_coef)
+        self.logger.record("train/qmp_bc_buffer_size", float(buffer_size))
+
+    def _qmp_bc_size(self):
+        if self._qmp_bc_observations is None:
+            return 0
+        return (
+            self.qmp_bc_buffer_size
+            if self._qmp_bc_full
+            else self._qmp_bc_position
+        )
+
+    @staticmethod
+    def _numpy_observation_batch(observations):
+        if isinstance(observations, dict):
+            result = {}
+            for key, value in observations.items():
+                value = np.asarray(value, dtype=np.float32)
+                result[key] = value.reshape(1, -1) if value.ndim == 1 else value
+            return result
+
+        observations = np.asarray(observations, dtype=np.float32)
+        return observations.reshape(1, -1) if observations.ndim == 1 else observations
 
     def predict_qmp(self, observation, deterministic=True, episode_start=False):
         """Select one action with the rollout QMP schedule and return diagnostics."""
@@ -204,6 +347,8 @@ class QMPSAC(SAC):
                 "primitive_only_active": False,
                 "object_held": False,
                 "commitment_remaining": 0,
+                "valid_candidates": ["target"],
+                "target_margin_fallback": False,
             }
 
         diagnostics = {
@@ -213,6 +358,10 @@ class QMPSAC(SAC):
             "primitive_only_active": self.qmp_last_primitive_only_active,
             "object_held": bool(self.qmp_last_object_held[0]),
             "commitment_remaining": int(self.qmp_last_commitment_remaining[0]),
+            "valid_candidates": list(self.qmp_last_valid_candidate_names[0]),
+            "target_margin_fallback": bool(
+                self.qmp_last_target_margin_fallback[0]
+            ),
         }
         if not is_vectorized:
             selected_action = selected_action[0]
@@ -249,6 +398,7 @@ class QMPSAC(SAC):
         self.qmp_last_object_held = object_held.astype(bool).tolist()
         self.qmp_last_gate_active = bool(gate_active)
         self.qmp_last_primitive_only_active = bool(primitive_only_active)
+        self.qmp_last_target_margin_fallback = [False] * n_envs
 
         warmup_steps = max(int(learning_starts), self.qmp_warmup_steps)
         if gate_active:
@@ -266,6 +416,10 @@ class QMPSAC(SAC):
                 n_envs,
                 q_values=q_values,
             )
+            self.qmp_last_valid_candidate_names = [
+                ["insert" if held else "grasp"]
+                for held in object_held
+            ]
         elif primitive_only_active and self.num_timesteps < warmup_steps:
             q_values = None
             if record_q_values:
@@ -282,11 +436,17 @@ class QMPSAC(SAC):
                 q_values=q_values,
             )
         elif primitive_only_active:
+            valid_mask, stage_names = self._build_stage_candidate_mask(
+                candidate_names,
+                object_held,
+            )
             selected_action = self._select_q_action(
                 candidate_names,
                 candidate_actions,
                 n_envs,
                 allow_random=False,
+                valid_candidate_mask=valid_mask,
+                stage_primitive_names=stage_names,
             )
         else:
             target_action, _ = self.predict(
@@ -296,11 +456,17 @@ class QMPSAC(SAC):
             target_action = self._ensure_action_batch(target_action, n_envs)
             candidate_names = ["target", *candidate_names]
             candidate_actions = [target_action, *candidate_actions]
+            valid_mask, stage_names = self._build_stage_candidate_mask(
+                candidate_names,
+                object_held,
+            )
             selected_action = self._select_q_action(
                 candidate_names,
                 candidate_actions,
                 n_envs,
                 allow_random=allow_random,
+                valid_candidate_mask=valid_mask,
+                stage_primitive_names=stage_names,
             )
 
         self.qmp_last_commitment_remaining = (
@@ -329,6 +495,35 @@ class QMPSAC(SAC):
             candidate_actions.append(action.astype(np.float32))
 
         return candidate_names, candidate_actions
+
+    def _build_stage_candidate_mask(self, candidate_names, object_held):
+        n_envs = len(object_held)
+        valid_mask = np.ones((n_envs, len(candidate_names)), dtype=bool)
+        stage_names = ["insert" if held else "grasp" for held in object_held]
+        if not self.qmp_stage_aware_mask:
+            self.qmp_last_valid_candidate_names = [list(candidate_names)] * n_envs
+            return valid_mask, stage_names
+
+        name_to_index = {name: index for index, name in enumerate(candidate_names)}
+        valid_mask.fill(False)
+        if "target" in name_to_index:
+            valid_mask[:, name_to_index["target"]] = True
+        for env_index, stage_name in enumerate(stage_names):
+            if stage_name not in name_to_index:
+                raise ValueError(
+                    f"Stage-aware QMP requires primitive '{stage_name}'."
+                )
+            valid_mask[env_index, name_to_index[stage_name]] = True
+
+        self.qmp_last_valid_candidate_names = [
+            [
+                name
+                for candidate_index, name in enumerate(candidate_names)
+                if valid_mask[env_index, candidate_index]
+            ]
+            for env_index in range(n_envs)
+        ]
+        return valid_mask, stage_names
 
     def _select_gated_primitive(
         self,
@@ -391,6 +586,8 @@ class QMPSAC(SAC):
         candidate_actions,
         n_envs,
         allow_random,
+        valid_candidate_mask=None,
+        stage_primitive_names=None,
     ):
         action_stack = np.stack(candidate_actions, axis=1)
         q_array, mean_q_values = self._evaluate_candidate_q_values(
@@ -398,12 +595,36 @@ class QMPSAC(SAC):
             candidate_actions,
             n_envs,
         )
-        selected_indices = np.argmax(q_array, axis=1)
+        if valid_candidate_mask is None:
+            valid_candidate_mask = np.ones_like(q_array, dtype=bool)
+            self.qmp_last_valid_candidate_names = [list(candidate_names)] * n_envs
+        masked_q_array = np.where(valid_candidate_mask, q_array, -np.inf)
+        selected_indices = np.argmax(masked_q_array, axis=1)
+
+        margin_fallback = np.zeros(n_envs, dtype=bool)
+        if (
+            self.qmp_target_q_margin > 0.0
+            and "target" in candidate_names
+            and stage_primitive_names is not None
+        ):
+            target_index = candidate_names.index("target")
+            for env_index, stage_name in enumerate(stage_primitive_names):
+                stage_index = candidate_names.index(stage_name)
+                if (
+                    selected_indices[env_index] == target_index
+                    and q_array[env_index, target_index]
+                    < q_array[env_index, stage_index] + self.qmp_target_q_margin
+                ):
+                    selected_indices[env_index] = stage_index
+                    margin_fallback[env_index] = True
+
+        self.qmp_last_target_margin_fallback = margin_fallback.tolist()
         selected_action, selected_names = self._apply_primitive_commitment(
             candidate_names,
             action_stack,
             selected_indices,
             allow_random=allow_random,
+            valid_candidate_mask=valid_candidate_mask,
         )
         self._store_qmp_selection(candidate_names, selected_names, mean_q_values)
         return selected_action
@@ -444,14 +665,21 @@ class QMPSAC(SAC):
         action_stack,
         proposed_indices,
         allow_random,
+        valid_candidate_mask=None,
     ):
         name_to_index = {name: index for index, name in enumerate(candidate_names)}
         selected_indices = np.asarray(proposed_indices, dtype=np.int64).copy()
         decision_mask = np.ones(selected_indices.shape[0], dtype=bool)
+        if valid_candidate_mask is None:
+            valid_candidate_mask = np.ones(
+                (selected_indices.shape[0], len(candidate_names)),
+                dtype=bool,
+            )
 
         for env_index, committed_name in enumerate(self._qmp_committed_names):
             if (
                 committed_name in name_to_index
+                and valid_candidate_mask[env_index, name_to_index[committed_name]]
                 and self._qmp_commitment_remaining[env_index] > 0
             ):
                 selected_indices[env_index] = name_to_index[committed_name]

@@ -17,11 +17,12 @@ class PandaQMPInsertEnv(PandaInsertEnv):
         randomize_object=True,
         randomize_socket=True,
         frame_skip=10,
-        max_steps=350,
+        max_steps=500,
         cartesian_scale=0.025,
         rotation_scale=0.08,
         insert_tolerance=0.01,
         success_bonus=1.0,
+        sparse_reward_mode="negative",
         ik_max_joint_step=0.08,
         terminate_on_success=True,
     ):
@@ -42,6 +43,11 @@ class PandaQMPInsertEnv(PandaInsertEnv):
         )
 
         self.randomize_object = randomize_object
+        if sparse_reward_mode not in {"negative", "positive"}:
+            raise ValueError(
+                "sparse_reward_mode must be either 'negative' or 'positive'."
+            )
+        self.sparse_reward_mode = sparse_reward_mode
         self.default_cube_pos = np.array(
             [0.45, -0.12, self.cube_half_size],
             dtype=np.float64,
@@ -129,6 +135,8 @@ class PandaQMPInsertEnv(PandaInsertEnv):
         desired_goal = np.asarray(desired_goal, dtype=np.float32)
         distance = np.linalg.norm(achieved_goal - desired_goal, axis=-1)
         is_success = np.asarray(distance <= self.insert_tolerance, dtype=np.float32)
+        if self.sparse_reward_mode == "negative":
+            return is_success - 1.0
         return is_success * self.success_bonus
 
     def _reset_robot_open(self):
@@ -209,7 +217,8 @@ class PandaQMPInsertEnv(PandaInsertEnv):
         xy_distance = float(np.linalg.norm(insert_error[:2]))
         z_error = float(abs(insert_error[2]))
         reward = float(self.compute_reward(cube_pos, self.insert_target_pos, {}))
-        is_success = reward > 0.0
+        is_success = insert_distance <= self.insert_tolerance
+        reward_success_bonus = self.success_bonus if is_success else 0.0
 
         return reward, {
             "insert_distance": insert_distance,
@@ -218,7 +227,7 @@ class PandaQMPInsertEnv(PandaInsertEnv):
             "reach_distance": float(self._reach_distance()),
             "cube_lift_height": max(0.0, float(cube_pos[2] - self.initial_cube_z)),
             "reward_sparse": reward,
-            "reward_success_bonus": reward,
+            "reward_success_bonus": reward_success_bonus,
             "reward_total": reward,
             "is_success": bool(is_success),
         }
