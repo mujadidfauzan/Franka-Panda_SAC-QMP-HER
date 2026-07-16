@@ -62,10 +62,12 @@ class PandaQMPInsertEnv(PandaInsertEnv):
         )
         self.min_initial_socket_distance = 0.14
 
+        # Goal-dependent values live only in desired_goal so HER can relabel them
+        # without leaving a stale socket target inside the base observation.
         state_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(45,),
+            shape=(39,),
             dtype=np.float32,
         )
         goal_space = spaces.Box(
@@ -201,11 +203,28 @@ class PandaQMPInsertEnv(PandaInsertEnv):
         )
 
     def _get_obs(self):
-        state_obs = PandaInsertEnv._get_obs(self)
+        ee_pos, ee_mat = self._get_ee_pose()
         cube_pos = self.data.xpos[self.cube_body_id].copy().astype(np.float32)
+        cube_quat = self.data.xquat[self.cube_body_id].copy()
+        ee_to_cube = cube_pos - ee_pos
+
+        state_obs = np.concatenate(
+            [
+                ee_pos,
+                mat_to_quat_wxyz(ee_mat),
+                cube_pos,
+                cube_quat,
+                ee_to_cube,
+                self.data.qpos[self.arm_qpos_ids],
+                self.data.qvel[self.arm_dof_ids],
+                self.data.qpos[self.finger_qpos_ids],
+                self.data.qvel[self.cube_dof_id : self.cube_dof_id + 3],
+                self.data.qvel[self.cube_dof_id + 3 : self.cube_dof_id + 6],
+            ]
+        ).astype(np.float32)
 
         return {
-            "observation": state_obs.astype(np.float32),
+            "observation": state_obs,
             "achieved_goal": cube_pos,
             "desired_goal": self.insert_target_pos.astype(np.float32),
         }

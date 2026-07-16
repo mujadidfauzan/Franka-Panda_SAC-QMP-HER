@@ -78,6 +78,48 @@ class QMPHERTensorboardCallback(BaseCallback):
         object_held = getattr(self.model, "qmp_last_object_held", [])
         if object_held:
             self.logger.record("qmp/object_held", float(np.mean(object_held)))
+        stage_names = getattr(self.model, "qmp_last_stage_names", [])
+        if stage_names:
+            self.logger.record(
+                "qmp/stage_insert",
+                float(np.mean([stage == "insert" for stage in stage_names])),
+            )
+        grasp_verified = getattr(self.model, "qmp_last_grasp_verified", [])
+        if grasp_verified:
+            self.logger.record(
+                "qmp/grasp_verified",
+                float(np.mean(grasp_verified)),
+            )
+        object_lost = getattr(self.model, "qmp_last_object_lost", [])
+        if object_lost:
+            self.logger.record("qmp/object_lost", float(np.mean(object_lost)))
+        stage_locked = getattr(self.model, "qmp_last_stage_locked", [])
+        if stage_locked:
+            self.logger.record("qmp/stage_locked", float(np.mean(stage_locked)))
+        target_admitted = getattr(
+            self.model,
+            "qmp_last_target_stage_admitted",
+            [],
+        )
+        if target_admitted:
+            self.logger.record(
+                "qmp/target_stage_admitted",
+                float(np.mean(target_admitted)),
+            )
+        self.logger.record(
+            "qmp/target_admission_probability",
+            float(
+                getattr(
+                    self.model,
+                    "qmp_last_target_admission_probability",
+                    0.0,
+                )
+            ),
+        )
+        self.logger.record(
+            "qmp/epsilon",
+            float(self.model._current_qmp_epsilon()),
+        )
         self.logger.record(
             "qmp/gate_active",
             float(getattr(self.model, "qmp_last_gate_active", False)),
@@ -216,6 +258,12 @@ class PeriodicArtifactCallback(BaseCallback):
                             "primitive_only_active": self.num_timesteps
                             < self.model.qmp_primitive_only_steps,
                             "object_held": False,
+                            "stage": "grasp",
+                            "stage_locked": False,
+                            "target_stage_admitted": False,
+                            "target_admission_probability": (
+                                self.model._current_target_admission_probability()
+                            ),
                             "commitment_remaining": 0,
                         },
                         eval_step=0,
@@ -262,11 +310,21 @@ class PeriodicArtifactCallback(BaseCallback):
             "_last_episode_starts",
             "_qmp_committed_names",
             "_qmp_commitment_remaining",
+            "_qmp_stage_locked",
+            "_qmp_stage_names",
+            "_qmp_stage_loss_counts",
+            "_qmp_target_stage_admitted",
             "_qmp_was_primitive_only",
             "qmp_last_selected_names",
             "qmp_last_q_values",
             "qmp_last_candidate_names",
             "qmp_last_object_held",
+            "qmp_last_stage_names",
+            "qmp_last_grasp_verified",
+            "qmp_last_object_lost",
+            "qmp_last_stage_locked",
+            "qmp_last_target_stage_admitted",
+            "qmp_last_target_admission_probability",
             "qmp_last_gate_active",
             "qmp_last_primitive_only_active",
             "qmp_last_commitment_remaining",
@@ -285,6 +343,10 @@ class PeriodicArtifactCallback(BaseCallback):
     def _reset_qmp_selector_for_eval(self):
         self.model._qmp_committed_names = []
         self.model._qmp_commitment_remaining = np.zeros(0, dtype=np.int64)
+        self.model._qmp_stage_locked = np.zeros(0, dtype=bool)
+        self.model._qmp_stage_names = []
+        self.model._qmp_stage_loss_counts = np.zeros(0, dtype=np.int64)
+        self.model._qmp_target_stage_admitted = np.zeros(0, dtype=bool)
         self.model._qmp_was_primitive_only = False
 
     @staticmethod
@@ -320,6 +382,12 @@ class PeriodicArtifactCallback(BaseCallback):
         selected_q = format_q(selected_policy)
         phase = "GATED PRIMITIVES" if diagnostics.get("gate_active") else "Q SELECT"
         held = "YES" if diagnostics.get("object_held") else "NO"
+        stage = str(diagnostics.get("stage", "unknown")).upper()
+        stage_locked = "YES" if diagnostics.get("stage_locked") else "NO"
+        target_admitted = "YES" if diagnostics.get("target_stage_admitted") else "NO"
+        target_probability = float(
+            diagnostics.get("target_admission_probability", 0.0)
+        )
         commitment = int(diagnostics.get("commitment_remaining", 0))
         valid_candidates = ",".join(diagnostics.get("valid_candidates", [])) or "N/A"
         margin_fallback = "YES" if diagnostics.get("target_margin_fallback") else "NO"
@@ -329,7 +397,9 @@ class PeriodicArtifactCallback(BaseCallback):
             f"Selected: {selected_policy.upper()} | Q: {selected_q}",
             f"Q target {format_q('target')} | grasp {format_q('grasp')}",
             f"Q insert {format_q('insert')}",
-            f"Mode: {phase} | held: {held} | commit: {commitment}",
+            f"Mode: {phase} | stage: {stage} | held: {held}",
+            f"Stage lock: {stage_locked} | fixed commit: {commitment}",
+            f"Target admitted: {target_admitted} | p={target_probability:.3f}",
             f"Valid: {valid_candidates} | Q fallback: {margin_fallback}",
             f"Reward: {float(reward):+.2f} | insert dist: {insert_distance:.4f} m",
         ]
@@ -583,17 +653,30 @@ def parse_args():
     parser.add_argument("--grasp-lift-height", type=float, default=0.03)
     parser.add_argument("--grasp-close-distance", type=float, default=0.01)
     parser.add_argument("--qmp-epsilon", type=float, default=0.05)
+    parser.add_argument("--qmp-epsilon-end-steps", type=int, default=500_000)
     parser.add_argument("--qmp-warmup-steps", type=int, default=None)
     parser.add_argument("--primitive-only-steps", type=int, default=500_000)
     parser.add_argument("--primitive-gate-steps", type=int, default=500_000)
     parser.add_argument("--primitive-commitment-min-steps", type=int, default=10)
     parser.add_argument("--primitive-commitment-max-steps", type=int, default=30)
+    parser.add_argument("--no-stage-commitment", action="store_true")
     parser.add_argument("--held-min-lift-height", type=float, default=0.01)
     parser.add_argument("--held-max-ee-distance", type=float, default=0.06)
     parser.add_argument("--held-max-gripper-qpos", type=float, default=0.03)
+    parser.add_argument("--lost-min-ee-distance", type=float, default=0.10)
+    parser.add_argument("--lost-min-gripper-qpos", type=float, default=0.035)
+    parser.add_argument("--stage-loss-patience", type=int, default=5)
     parser.add_argument("--no-stage-aware-mask", action="store_true")
-    parser.add_argument("--target-q-margin", type=float, default=0.05)
-    parser.add_argument("--bc-steps", type=int, default=500_000)
+    parser.add_argument("--target-q-margin", type=float, default=0.5)
+    parser.add_argument(
+        "--target-max-admission-probability",
+        type=float,
+        default=0.2,
+    )
+    parser.add_argument("--target-admission-ramp-steps", type=int, default=1_000_000)
+    parser.add_argument("--stochastic-target-candidate", action="store_true")
+    parser.add_argument("--bc-steps", type=int, default=1_500_000)
+    parser.add_argument("--bc-anneal-start-steps", type=int, default=500_000)
     parser.add_argument("--bc-coef", type=float, default=1.0)
     parser.add_argument("--bc-batch-size", type=int, default=256)
     parser.add_argument("--bc-buffer-size", type=int, default=100_000)
@@ -652,8 +735,30 @@ def main():
         )
     if args.target_q_margin < 0.0:
         raise ValueError("--target-q-margin must be non-negative.")
+    if args.qmp_epsilon_end_steps < 0:
+        raise ValueError("--qmp-epsilon-end-steps must be non-negative.")
+    if args.stage_loss_patience < 1:
+        raise ValueError("--stage-loss-patience must be at least 1.")
+    if args.lost_min_ee_distance <= args.held_max_ee_distance:
+        raise ValueError(
+            "--lost-min-ee-distance must exceed --held-max-ee-distance."
+        )
+    if args.lost_min_gripper_qpos <= args.held_max_gripper_qpos:
+        raise ValueError(
+            "--lost-min-gripper-qpos must exceed --held-max-gripper-qpos."
+        )
+    if not 0.0 <= args.target_max_admission_probability <= 1.0:
+        raise ValueError(
+            "--target-max-admission-probability must be in [0, 1]."
+        )
+    if args.target_admission_ramp_steps < 0:
+        raise ValueError("--target-admission-ramp-steps must be non-negative.")
     if args.bc_steps < 0 or args.bc_coef < 0.0:
         raise ValueError("--bc-steps and --bc-coef must be non-negative.")
+    if not 0 <= args.bc_anneal_start_steps <= args.bc_steps:
+        raise ValueError(
+            "--bc-anneal-start-steps must be between zero and --bc-steps."
+        )
     if args.bc_batch_size < 1 or args.bc_buffer_size < 1:
         raise ValueError("--bc-batch-size and --bc-buffer-size must be positive.")
 
@@ -692,8 +797,13 @@ def main():
         "then stage-masked target + primitive candidates; "
         f"primitive commitment {args.primitive_commitment_min_steps}-"
         f"{args.primitive_commitment_max_steps} steps; "
+        f"stage lock {not args.no_stage_commitment}; "
         f"target Q margin {args.target_q_margin}; "
-        f"BC coef {qmp_bc_coef} through {args.bc_steps} steps; "
+        f"target admission 0->{args.target_max_admission_probability} over "
+        f"{args.target_admission_ramp_steps} steps; "
+        f"BC coef {qmp_bc_coef} annealed from {args.bc_anneal_start_steps} "
+        f"through {args.bc_steps} steps; "
+        f"epsilon ends at {args.qmp_epsilon_end_steps}; "
         f"reward mode {args.sparse_reward_mode}."
     )
 
@@ -706,16 +816,27 @@ def main():
             primitive_policies=primitive_policies,
             qmp_warmup_steps=qmp_warmup_steps,
             qmp_epsilon=args.qmp_epsilon,
+            qmp_epsilon_end_steps=args.qmp_epsilon_end_steps,
             qmp_primitive_only_steps=args.primitive_only_steps,
             qmp_gate_steps=args.primitive_gate_steps,
             qmp_commitment_min_steps=args.primitive_commitment_min_steps,
             qmp_commitment_max_steps=args.primitive_commitment_max_steps,
+            qmp_stage_commitment=not args.no_stage_commitment,
             qmp_held_min_lift_height=args.held_min_lift_height,
             qmp_held_max_ee_distance=args.held_max_ee_distance,
             qmp_held_max_gripper_qpos=args.held_max_gripper_qpos,
+            qmp_lost_min_ee_distance=args.lost_min_ee_distance,
+            qmp_lost_min_gripper_qpos=args.lost_min_gripper_qpos,
+            qmp_stage_loss_patience=args.stage_loss_patience,
             qmp_stage_aware_mask=not args.no_stage_aware_mask,
             qmp_target_q_margin=args.target_q_margin,
+            qmp_target_max_admission_probability=(
+                args.target_max_admission_probability
+            ),
+            qmp_target_admission_ramp_steps=args.target_admission_ramp_steps,
+            qmp_deterministic_target=not args.stochastic_target_candidate,
             qmp_bc_steps=args.bc_steps,
+            qmp_bc_anneal_start_steps=args.bc_anneal_start_steps,
             qmp_bc_coef=qmp_bc_coef,
             qmp_bc_batch_size=args.bc_batch_size,
             qmp_bc_buffer_size=args.bc_buffer_size,
@@ -735,16 +856,27 @@ def main():
             primitive_policies=primitive_policies,
             qmp_warmup_steps=qmp_warmup_steps,
             qmp_epsilon=args.qmp_epsilon,
+            qmp_epsilon_end_steps=args.qmp_epsilon_end_steps,
             qmp_primitive_only_steps=args.primitive_only_steps,
             qmp_gate_steps=args.primitive_gate_steps,
             qmp_commitment_min_steps=args.primitive_commitment_min_steps,
             qmp_commitment_max_steps=args.primitive_commitment_max_steps,
+            qmp_stage_commitment=not args.no_stage_commitment,
             qmp_held_min_lift_height=args.held_min_lift_height,
             qmp_held_max_ee_distance=args.held_max_ee_distance,
             qmp_held_max_gripper_qpos=args.held_max_gripper_qpos,
+            qmp_lost_min_ee_distance=args.lost_min_ee_distance,
+            qmp_lost_min_gripper_qpos=args.lost_min_gripper_qpos,
+            qmp_stage_loss_patience=args.stage_loss_patience,
             qmp_stage_aware_mask=not args.no_stage_aware_mask,
             qmp_target_q_margin=args.target_q_margin,
+            qmp_target_max_admission_probability=(
+                args.target_max_admission_probability
+            ),
+            qmp_target_admission_ramp_steps=args.target_admission_ramp_steps,
+            qmp_deterministic_target=not args.stochastic_target_candidate,
             qmp_bc_steps=args.bc_steps,
+            qmp_bc_anneal_start_steps=args.bc_anneal_start_steps,
             qmp_bc_coef=qmp_bc_coef,
             qmp_bc_batch_size=args.bc_batch_size,
             qmp_bc_buffer_size=args.bc_buffer_size,
